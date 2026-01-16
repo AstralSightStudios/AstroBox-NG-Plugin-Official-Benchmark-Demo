@@ -1,8 +1,8 @@
 {
-    "name": "Blank Template",
+    "name": "Benchmark",
     "icon": "icon.png",
     "version": "1.0.0",
-    "description": "一个示例 AstroBox 插件",
+    "description": "插件系统性能测试",
     "author": "AstroBox Team",
     "website": "https://example.com",
     "entry": "astrobox_ng_plugin_template_rust.wasm",
