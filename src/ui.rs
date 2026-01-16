@@ -10,6 +10,8 @@ struct UiState {
     progress_done: usize,
     progress_total: usize,
     status: String,
+    chunk_index: usize,
+    chunk_total: usize,
     result_lines: Vec<String>,
     result_json: Option<String>,
 }
@@ -20,6 +22,8 @@ struct UiSnapshot {
     progress_done: usize,
     progress_total: usize,
     status: String,
+    chunk_index: usize,
+    chunk_total: usize,
     result_lines: Vec<String>,
     result_json: Option<String>,
 }
@@ -34,6 +38,8 @@ fn ui_state() -> &'static Mutex<UiState> {
             progress_done: 0,
             progress_total: benchmark::TOTAL_STEPS,
             status: "等待开始".to_string(),
+            chunk_index: 0,
+            chunk_total: 0,
             result_lines: Vec::new(),
             result_json: None,
         })
@@ -46,6 +52,8 @@ fn snapshot_from(state: &UiState) -> UiSnapshot {
         progress_done: state.progress_done,
         progress_total: state.progress_total,
         status: state.status.clone(),
+        chunk_index: state.chunk_index,
+        chunk_total: state.chunk_total,
         result_lines: state.result_lines.clone(),
         result_json: state.result_json.clone(),
     }
@@ -78,6 +86,7 @@ fn format_progress_status(update: &ProgressUpdate) -> String {
     let status = match update.status {
         BenchStepStatus::Started => "开始",
         BenchStepStatus::Finished => "完成",
+        BenchStepStatus::Chunk => "进行中",
     };
     format!(
         "{} {} {}/{} {}",
@@ -85,15 +94,32 @@ fn format_progress_status(update: &ProgressUpdate) -> String {
     )
 }
 
+fn effective_note() -> Option<String> {
+    if benchmark::EFFECTIVE_N1 != benchmark::BENCH_N1
+        || benchmark::EFFECTIVE_N2 != benchmark::BENCH_N2
+    {
+        Some(format!(
+            " (effective n1={} n2={} maxChunks={})",
+            benchmark::EFFECTIVE_N1,
+            benchmark::EFFECTIVE_N2,
+            benchmark::MAX_CHUNKS
+        ))
+    } else {
+        None
+    }
+}
+
 fn build_result_lines(result: &benchmark::BenchmarkResult) -> Vec<String> {
+    let note = effective_note().unwrap_or_default();
     vec![
         format!(
-            "参数: --seed {} --n1 {} --n2 {} --warmup {} --repeats {}",
+            "参数: --seed {} --n1 {} --n2 {} --warmup {} --repeats {}{}",
             benchmark::BENCH_SEED,
             benchmark::BENCH_N1,
             benchmark::BENCH_N2,
             benchmark::BENCH_WARMUP,
-            benchmark::BENCH_REPEATS
+            benchmark::BENCH_REPEATS,
+            note
         ),
         format!("{} digest: {:016x}", result.t1.id, result.t1.digest),
         format!(
@@ -129,6 +155,8 @@ fn run_benchmark_with_ui() {
         state.progress_done = 0;
         state.progress_total = benchmark::TOTAL_STEPS;
         state.status = "准备测试...".to_string();
+        state.chunk_index = 0;
+        state.chunk_total = 0;
         state.result_lines.clear();
         state.result_json = None;
         let root = state.root_element_id.clone();
@@ -146,6 +174,8 @@ fn run_benchmark_with_ui() {
             state.status = status;
             state.progress_done = update.completed_steps;
             state.progress_total = update.total_steps;
+            state.chunk_index = update.chunk_index;
+            state.chunk_total = update.chunk_total;
         });
     });
 
@@ -171,13 +201,15 @@ pub fn ui_event_processor(evtype: ui::Event, event: &str) {
 
 fn build_main_ui(snapshot: &UiSnapshot) -> ui::Element {
     let title_text = "AstroBox Benchmark";
+    let note = effective_note().unwrap_or_default();
     let subtitle_text = format!(
-        "固定参数: --seed {} --n1 {} --n2 {} --warmup {} --repeats {}",
+        "固定参数: --seed {} --n1 {} --n2 {} --warmup {} --repeats {}{}",
         benchmark::BENCH_SEED,
         benchmark::BENCH_N1,
         benchmark::BENCH_N2,
         benchmark::BENCH_WARMUP,
-        benchmark::BENCH_REPEATS
+        benchmark::BENCH_REPEATS,
+        note
     );
 
     let title = ui::Element::new(ui::ElementType::P, Some(title_text))
@@ -217,6 +249,16 @@ fn build_main_ui(snapshot: &UiSnapshot) -> ui::Element {
         .margin_bottom(6);
 
     let status = ui::Element::new(ui::ElementType::P, Some(snapshot.status.as_str()))
+        .size(14)
+        .text_color("#444444")
+        .margin_bottom(6);
+
+    let chunk_text = if snapshot.running && snapshot.chunk_total > 0 {
+        format!("Chunk: {}/{}", snapshot.chunk_index, snapshot.chunk_total)
+    } else {
+        "Chunk: -".to_string()
+    };
+    let chunk = ui::Element::new(ui::ElementType::P, Some(chunk_text.as_str()))
         .size(14)
         .text_color("#444444")
         .margin_bottom(12);
@@ -263,6 +305,7 @@ fn build_main_ui(snapshot: &UiSnapshot) -> ui::Element {
         .child(start_button)
         .child(progress)
         .child(status)
+        .child(chunk)
         .child(results_container)
 }
 

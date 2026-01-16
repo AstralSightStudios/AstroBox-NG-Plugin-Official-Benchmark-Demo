@@ -6,6 +6,19 @@ pub const BENCH_N2: u64 = 200_000_000;
 pub const BENCH_WARMUP: usize = 3;
 pub const BENCH_REPEATS: usize = 9;
 pub const TOTAL_STEPS: usize = 2 * (BENCH_WARMUP + BENCH_REPEATS);
+pub const MAX_CHUNKS: u64 = 10;
+pub const INT_CHUNK_SIZE: u64 = 1_000_000;
+pub const FP_CHUNK_SIZE: u64 = 1_000_000;
+pub const EFFECTIVE_N1: u64 = if BENCH_N1 < INT_CHUNK_SIZE * MAX_CHUNKS {
+    BENCH_N1
+} else {
+    INT_CHUNK_SIZE * MAX_CHUNKS
+};
+pub const EFFECTIVE_N2: u64 = if BENCH_N2 < FP_CHUNK_SIZE * MAX_CHUNKS {
+    BENCH_N2
+} else {
+    FP_CHUNK_SIZE * MAX_CHUNKS
+};
 
 #[derive(Clone, Copy)]
 pub enum BenchPhase {
@@ -17,6 +30,7 @@ pub enum BenchPhase {
 pub enum BenchStepStatus {
     Started,
     Finished,
+    Chunk,
 }
 
 pub struct ProgressUpdate {
@@ -27,6 +41,8 @@ pub struct ProgressUpdate {
     pub completed_steps: usize,
     pub total_steps: usize,
     pub status: BenchStepStatus,
+    pub chunk_index: usize,
+    pub chunk_total: usize,
 }
 
 pub struct BenchStats {
@@ -99,53 +115,95 @@ impl XorShift32 {
 
 // -------- Benchmarks --------
 #[inline(never)]
-fn bench_int32_mix(seed: u32, n: u64) -> u32 {
+fn bench_int32_mix<F>(seed: u32, n: u64, chunk_size: u64, mut on_chunk: F) -> u32
+where
+    F: FnMut(usize, usize),
+{
     let mut rng = XorShift32::new(seed);
     let mut acc: u32 = 0x1234_5678;
 
-    for i in 0..n {
-        let x = rng.next_u32();
-        let mut v = x ^ acc;
-        v = v.rotate_left((i as u32) & 31);
-        v = v.wrapping_mul(0x9E37_79B1);
-        v ^= v >> 16;
-        acc = acc.wrapping_add(v);
-        if (v & 0x8000) != 0 {
-            acc ^= 0xA5A5_A5A5;
+    if n == 0 || chunk_size == 0 {
+        return std::hint::black_box(acc);
+    }
+
+    let total_chunks = chunk_total(n, chunk_size);
+    let mut i = 0u64;
+    let mut chunk_index = 0usize;
+    while i < n {
+        chunk_index += 1;
+        on_chunk(chunk_index, total_chunks);
+        let end = (i + chunk_size).min(n);
+        for j in i..end {
+            let x = rng.next_u32();
+            let mut v = x ^ acc;
+            v = v.rotate_left((j as u32) & 31);
+            v = v.wrapping_mul(0x9E37_79B1);
+            v ^= v >> 16;
+            acc = acc.wrapping_add(v);
+            if (v & 0x8000) != 0 {
+                acc ^= 0xA5A5_A5A5;
+            }
         }
+        i = end;
     }
 
     std::hint::black_box(acc)
 }
 
 #[inline(never)]
-fn bench_fp64_dot(seed: u32, n: u64) -> u64 {
+fn bench_fp64_dot<F>(seed: u32, n: u64, chunk_size: u64, mut on_chunk: F) -> u64
+where
+    F: FnMut(usize, usize),
+{
     let mut rng = XorShift32::new(seed ^ 0xDEAD_BEEF);
     let mut sum: f64 = 0.0;
     let c: f64 = 1e-9;
 
-    for _ in 0..n {
-        let a = rng.next_f64_01();
-        let b = rng.next_f64_01();
-        sum = sum + (a * b + c);
+    if n == 0 || chunk_size == 0 {
+        return std::hint::black_box(sum.to_bits());
+    }
+
+    let total_chunks = chunk_total(n, chunk_size);
+    let mut i = 0u64;
+    let mut chunk_index = 0usize;
+    while i < n {
+        chunk_index += 1;
+        on_chunk(chunk_index, total_chunks);
+        let end = (i + chunk_size).min(n);
+        for _ in i..end {
+            let a = rng.next_f64_01();
+            let b = rng.next_f64_01();
+            sum = sum + (a * b + c);
+        }
+        i = end;
     }
 
     std::hint::black_box(sum.to_bits())
+}
+
+fn chunk_total(n: u64, chunk_size: u64) -> usize {
+    if chunk_size == 0 {
+        return 0;
+    }
+    ((n + chunk_size - 1) / chunk_size) as usize
 }
 
 fn run_bench<F, P>(
     name: &'static str,
     warmup: usize,
     repeats: usize,
+    iterations: u64,
+    chunk_size: u64,
     mut f: F,
     progress: &mut P,
     completed_steps: &mut usize,
     total_steps: usize,
 ) -> (u64, Vec<f64>)
 where
-    F: FnMut() -> u64,
+    F: FnMut(&mut dyn FnMut(usize, usize)) -> u64,
     P: FnMut(ProgressUpdate),
 {
+    let total_chunks = chunk_total(iterations, chunk_size);
     let mut last = 0u64;
     for i in 0..warmup {
         progress(ProgressUpdate {
@@ -156,8 +214,25 @@ where
             completed_steps: *completed_steps,
             total_steps,
             status: BenchStepStatus::Started,
+            chunk_index: 0,
+            chunk_total: total_chunks,
         });
-        last = f();
+        {
+            let mut on_chunk = |chunk_index: usize, chunk_total: usize| {
+                progress(ProgressUpdate {
+                    bench_id: name,
+                    phase: BenchPhase::Warmup,
+                    index: i + 1,
+                    total: warmup,
+                    completed_steps: *completed_steps,
+                    total_steps,
+                    status: BenchStepStatus::Chunk,
+                    chunk_index,
+                    chunk_total,
+                });
+            };
+            last = f(&mut on_chunk);
+        }
         *completed_steps += 1;
         progress(ProgressUpdate {
             bench_id: name,
@@ -167,6 +242,8 @@ where
             completed_steps: *completed_steps,
             total_steps,
             status: BenchStepStatus::Finished,
+            chunk_index: total_chunks,
+            chunk_total: total_chunks,
         });
     }
 
@@ -180,9 +257,26 @@ where
             completed_steps: *completed_steps,
             total_steps,
             status: BenchStepStatus::Started,
+            chunk_index: 0,
+            chunk_total: total_chunks,
         });
         let t0 = Instant::now();
-        last = f();
+        {
+            let mut on_chunk = |chunk_index: usize, chunk_total: usize| {
+                progress(ProgressUpdate {
+                    bench_id: name,
+                    phase: BenchPhase::Measure,
+                    index: i + 1,
+                    total: repeats,
+                    completed_steps: *completed_steps,
+                    total_steps,
+                    status: BenchStepStatus::Chunk,
+                    chunk_index,
+                    chunk_total,
+                });
+            };
+            last = f(&mut on_chunk);
+        }
         times.push(t0.elapsed().as_secs_f64() * 1000.0);
         *completed_steps += 1;
         progress(ProgressUpdate {
@@ -193,6 +287,8 @@ where
             completed_steps: *completed_steps,
             total_steps,
             status: BenchStepStatus::Finished,
+            chunk_index: total_chunks,
+            chunk_total: total_chunks,
         });
     }
     tracing::info!("{} done. last_digest={:016x}", name, last);
@@ -218,7 +314,9 @@ where
         "T1_INT32_MIX",
         BENCH_WARMUP,
         BENCH_REPEATS,
-        || bench_int32_mix(BENCH_SEED, BENCH_N1) as u64,
+        EFFECTIVE_N1,
+        INT_CHUNK_SIZE,
+        |on_chunk| bench_int32_mix(BENCH_SEED, EFFECTIVE_N1, INT_CHUNK_SIZE, on_chunk) as u64,
         &mut progress,
         &mut completed_steps,
         TOTAL_STEPS,
@@ -228,7 +326,9 @@ where
         "T2_FP64_DOT",
         BENCH_WARMUP,
         BENCH_REPEATS,
-        || bench_fp64_dot(BENCH_SEED, BENCH_N2),
+        EFFECTIVE_N2,
+        FP_CHUNK_SIZE,
+        |on_chunk| bench_fp64_dot(BENCH_SEED, EFFECTIVE_N2, FP_CHUNK_SIZE, on_chunk),
         &mut progress,
         &mut completed_steps,
         TOTAL_STEPS,
@@ -243,6 +343,7 @@ where
   "lang": "rust",
   "seed": {seed},
   "params": {{ "n1": {n1}, "n2": {n2}, "warmup": {warmup}, "repeats": {repeats} }},
+  "effective_params": {{ "n1": {en1}, "n2": {en2}, "max_chunks": {max_chunks}, "chunk_size_int": {chunk_int}, "chunk_size_fp": {chunk_fp} }},
   "results": [
     {{
       "id": "T1_INT32_MIX",
@@ -260,6 +361,11 @@ where
         seed = BENCH_SEED,
         n1 = BENCH_N1,
         n2 = BENCH_N2,
+        en1 = EFFECTIVE_N1,
+        en2 = EFFECTIVE_N2,
+        max_chunks = MAX_CHUNKS,
+        chunk_int = INT_CHUNK_SIZE,
+        chunk_fp = FP_CHUNK_SIZE,
         warmup = BENCH_WARMUP,
         repeats = BENCH_REPEATS,
         d1 = d1,
